@@ -41,10 +41,14 @@ async def extract_course_info(url: str):
         result = await crawler.arun(url=url, config=run_config)
         
         if result.success:
-            print("\n✅ Pobieranie zakończone sukcesem! Oto wyczyszczony tekst (Markdown):\n")
-            # Wyświetlamy pierwsze 1000 znaków, żeby nie zalać konsoli całym tekstem ze strony
-            print(result.markdown[:1000])
-            print("\n... [reszta tekstu ucięta dla czytelności] ...")
+            print("\n✅ Pobieranie zakończone! Zapisuję wyczyszczony tekst do pliku...")
+            
+            # Tworzymy nazwę pliku i zapisujemy czysty markdown
+            filename = "scraped_pja.md"
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write(result.markdown)
+                
+            print(f"📄 Gotowe! Plik '{filename}' został utworzony w Twoim folderze.")
         else:
             print(f"\n❌ Błąd podczas skanowania: {result.error_message}")
 
