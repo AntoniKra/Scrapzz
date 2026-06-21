@@ -1,0 +1,6 @@
+/* Global reset — szczegółowe style są w App.css */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
