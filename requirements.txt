@@ -1,0 +1,9 @@
+# Scrapzz — bezpośrednie zależności backendu (weryfikowane na Python 3.12)
+# Po instalacji uruchom: playwright install chromium
+
+crawl4ai==0.9.0
+fastapi==0.137.2
+google-genai==2.8.0
+pydantic==2.13.4
+python-dotenv==1.2.2
+uvicorn==0.49.0

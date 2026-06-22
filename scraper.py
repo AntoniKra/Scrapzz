@@ -5,8 +5,13 @@ import sys
 import time
 import re
 import threading
+from pathlib import Path
 from typing import List, Optional, Literal
 from urllib.parse import urlparse, urljoin
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 # Playwright na Windows wymaga ProactorEventLoop (subprocessy w asyncio)
 if sys.platform == "win32":
@@ -73,7 +78,7 @@ class ScrapeResponse(BaseModel):
 
 # ── Konfiguracja Gemini ───────────────────────────────────────────────────────
 
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
 GEMINI_MIN_INTERVAL = 4.0
 MAX_COURSES_PER_RUN = 5
 

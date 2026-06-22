@@ -1,2 +1,12 @@
 venv/
 __pycache__/
+*.py[cod]
+
+# Sekrety — nigdy nie commituj
+.env
+.env.local
+.env.*.local
+
+# Frontend (build / cache)
+frontend/node_modules/
+frontend/dist/
