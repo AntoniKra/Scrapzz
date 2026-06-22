@@ -1,5 +1,7 @@
 # Scrapzz
 
+> Szczegółowy opis projektu, architektura i workflow: [PROJECT.md](PROJECT.md)
+
 Agregator danych o kierunkach studiów — spider (Crawl4AI + Playwright) + ekstrakcja strukturalna (Gemini) + frontend React.
 
 ## Wymagania
