@@ -75,7 +75,7 @@ class ScrapeResponse(BaseModel):
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
 GEMINI_MIN_INTERVAL = 4.0
-MAX_COURSES_PER_RUN = 10
+MAX_COURSES_PER_RUN = 5
 
 _gemini_client = genai.Client()
 _last_gemini_call = 0.0
@@ -149,9 +149,27 @@ JUNK_URL_PATTERN = re.compile(
 )
 
 COURSE_PATH_PATTERN = re.compile(
-    r"(oferta-studiow|/kierunek/|pokazKierunek|/studia/|/program/|/oferta/studia)",
+    r"(oferta-studiow|/kierunek/|pokazKierunek|/studia/|/program/|/oferta/studia|"
+    r"studia-i-stopnia/|studia-ii-stopnia/)",
     re.I,
 )
+
+# Strony katalogu / paginacji — nie strony konkretnego kierunku.
+CATALOG_PAGE_PATTERN = re.compile(
+    r"(oferta-studiow/strona(?:-\d+)?/?(?:\?|$)|"
+    r"(?:^|/)studia-i-stopnia/?(?:\?|#|$)|"
+    r"(?:^|/)studia-ii-stopnia/?(?:\?|#|$)|"
+    r"(?:^|/)strona-\d+/?(?:\?|#|$)|"
+    r"(?:^|/)page/\d+/?(?:\?|#|$))",
+    re.I,
+)
+
+
+def _normalize_url_for_compare(url: str) -> str:
+    parsed = urlparse(url)
+    path = parsed.path.rstrip("/") or "/"
+    return f"{parsed.scheme}://{parsed.netloc.lower()}{path.lower()}"
+
 
 def _is_junk_url(url: str) -> bool:
     """Filtruje śmieciowe ścieżki — nie sprawdza hosta (np. rekrutacja.p.lodz.pl)."""
@@ -162,22 +180,43 @@ def _is_junk_url(url: str) -> bool:
     return bool(JUNK_URL_PATTERN.search(haystack))
 
 
+def _is_catalog_list_url(url: str) -> bool:
+    """True dla stron listy kierunków / paginacji, nie pojedynczego kierunku."""
+    parsed = urlparse(url)
+    haystack = f"{parsed.path}?{parsed.query}"
+    return bool(CATALOG_PAGE_PATTERN.search(haystack))
+
+
+def _is_course_detail_url(url: str, catalog_url: Optional[str] = None) -> bool:
+    """Hybrid: odrzuć śmieci i katalogi; resztę (Gemini/HTML) wpuszczaj bez sztywnej whitelist."""
+    if _is_junk_url(url):
+        return False
+    if _is_catalog_list_url(url):
+        return False
+    if catalog_url and _normalize_url_for_compare(url) == _normalize_url_for_compare(catalog_url):
+        return False
+    return True
+
+
 COOKIE_BANNER_PATTERN = re.compile(
     r"(cookiebot|cookieyes|plików cookie|pliki cookie|akceptuj wszystko|"
-    r"accept all|consent|cybotcookiebotdialog)",
+    r"accept all|consent|cybotcookiebotdialog|omcookie)",
     re.I,
 )
 CATALOG_CONTENT_PATTERN = re.compile(
-    r"(card_post|filter-results|kierunek studiów|/oferta/studia-|/kierunek/)",
+    r"(card_post|filter-results|kierunek studiów|/oferta/studia-|/kierunek/|"
+    r"oferta-studiow/[^/\s]+|invulstructure|studia-i-stopnia/)",
     re.I,
 )
 
-# Tylko dla crawla katalogu — cookie + czekanie na AJAX + scroll (lazy-load).
+# Cookie + czekanie na treść katalogu (WordPress, TYPO3/UŁ, ATA) + zamknięcie menu mobilnego.
 CATALOG_JS_PREP = """
 (async () => {
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const acceptCookies = () => {
     const selectors = [
+      '[data-omcookie-panel-save="all"]',
+      '.cookie-panel__button--color--green',
       '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
       '#CybotCookiebotDialogBodyButtonAccept',
       '#CybotCookiebotDialogBodyButtonDecline',
@@ -190,16 +229,38 @@ CATALOG_JS_PREP = """
     }
     for (const el of document.querySelectorAll('button, a, [role="button"]')) {
       const t = (el.textContent || '').trim().toLowerCase();
-      if (/akceptuj|accept all|zgoda|^accept$/i.test(t)) { el.click(); return true; }
+      if (/akceptuj wszystkie|akceptuj|accept all|zgoda|^accept$/i.test(t)) { el.click(); return true; }
+    }
+    return false;
+  };
+  const closeMobileMenu = () => {
+    for (const el of document.querySelectorAll('button, a, [role="button"]')) {
+      const t = (el.textContent || '').trim();
+      if (/^zamknij$/i.test(t)) { el.click(); return true; }
+    }
+    return false;
+  };
+  const catalogReady = () => {
+    if (document.querySelector('.card_post_item')) return true;
+    if (document.querySelector('#filter-results a[href*="/oferta/"]')) return true;
+    const anchors = document.querySelectorAll(
+      'a[href*="/rekrutacja/oferta-studiow/"], a[href*="/oferta-studiow/"], a[href*="/kierunek/"]'
+    );
+    for (const a of anchors) {
+      const href = a.getAttribute('href') || '';
+      if (/oferta-studiow\\/strona/i.test(href)) continue;
+      if (/oferta-studiow\\/.+/i.test(href) || /\\/kierunek\\//i.test(href)) return true;
     }
     return false;
   };
   acceptCookies();
   await sleep(800);
   acceptCookies();
+  closeMobileMenu();
+  await sleep(400);
   const deadline = Date.now() + 12000;
   while (Date.now() < deadline) {
-    if (document.querySelector('.card_post_item, #filter-results a[href*="/oferta/"]')) break;
+    if (catalogReady()) break;
     await sleep(400);
   }
 })();
@@ -217,15 +278,453 @@ CATALOG_JS_SCROLL = """
 })();
 """
 
+# Strony kierunków: cookie + czekanie na AJAX cennika (ideis: .all-tuitions) + przełączenie lat.
+COURSE_JS_PREP = """
+(async () => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const acceptCookies = () => {
+    const selectors = [
+      '[data-omcookie-panel-save="all"]',
+      '.cookie-panel__button--color--green',
+      '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
+      '#CybotCookiebotDialogBodyButtonAccept',
+      'button[id*="accept"]',
+    ];
+    for (const sel of selectors) {
+      const el = document.querySelector(sel);
+      if (el) { el.click(); return true; }
+    }
+    for (const el of document.querySelectorAll('button, a, [role="button"]')) {
+      const t = (el.textContent || '').trim().toLowerCase();
+      if (/akceptuj wszystkie|akceptuj|accept all|zgoda|^accept$/i.test(t)) { el.click(); return true; }
+    }
+    return false;
+  };
+  const feeHasAmounts = (root) => {
+    const text = (root?.textContent || '').replace(/\\s+/g, ' ').trim();
+    return text.length > 30 && /\\d+\\s*zł/i.test(text);
+  };
+  const feesReady = () => {
+    for (const b of document.querySelectorAll('.all-tuitions, .mode-tab, [class*="tuition"]')) {
+      if (feeHasAmounts(b)) return true;
+    }
+    const body = document.body?.innerText || '';
+    return /czesne/i.test(body) && /\\d+\\s*zł/i.test(body);
+  };
+  acceptCookies();
+  await sleep(600);
+  acceptCookies();
+  for (const sel of document.querySelectorAll('.mode-tab select')) {
+    try {
+      for (const opt of sel.options) {
+        sel.value = opt.value;
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+        await sleep(350);
+      }
+    } catch (_) {}
+  }
+  const anchor = document.querySelector('.all-tuitions, .mode-tab, [class*="tuition"]');
+  if (anchor) anchor.scrollIntoView({ behavior: 'instant', block: 'center' });
+  const deadline = Date.now() + 12000;
+  while (Date.now() < deadline) {
+    if (feesReady()) break;
+    await sleep(350);
+  }
+  await sleep(400);
+})();
+"""
+
+COURSE_JS_SCROLL = """
+(async () => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const h = document.body?.scrollHeight || 0;
+  for (const y of [0, h * 0.35, h * 0.55, h * 0.75, h]) {
+    window.scrollTo(0, y);
+    await sleep(450);
+  }
+  const anchor = document.querySelector('.all-tuitions, .mode-tab');
+  if (anchor) anchor.scrollIntoView({ behavior: 'instant', block: 'center' });
+  await sleep(300);
+})();
+"""
+
+
+def _extract_course_links_from_crawl(result, base_url: str, catalog_url: Optional[str] = None) -> List[str]:
+    """Fallback: linki kierunków z HTML/crawl4ai links, gdy markdown/Gemini zawiodą."""
+    catalog_url = catalog_url or base_url
+    candidates: List[str] = []
+    links_obj = getattr(result, "links", None) or {}
+    if isinstance(links_obj, dict):
+        for bucket in ("internal", "external"):
+            for item in links_obj.get(bucket, []) or []:
+                href = item.get("href") if isinstance(item, dict) else str(item)
+                if href:
+                    candidates.append(urljoin(base_url, href))
+
+    for html_attr in ("html", "cleaned_html", "fit_html"):
+        html = getattr(result, html_attr, None) or ""
+        if not html:
+            continue
+        for match in re.finditer(r"""href=["']([^"']+)["']""", html):
+            candidates.append(urljoin(base_url, match.group(1)))
+
+    out: List[str] = []
+    for candidate in candidates:
+        if not candidate.startswith(("http://", "https://")):
+            continue
+        if _is_course_detail_url(candidate, catalog_url=catalog_url):
+            out.append(candidate)
+    return list(dict.fromkeys(out))
+
 
 def _catalog_markdown_looks_js_blocked(markdown: str) -> bool:
     """Heurystyka: markdown to głównie baner cookie, brak treści katalogu."""
-    if not markdown or len(markdown.strip()) < 8000:
+    if not markdown or not markdown.strip():
+        return True
+    if CATALOG_CONTENT_PATTERN.search(markdown):
+        return False
+    if len(markdown.strip()) < 8000:
         return True
     head = markdown[:3000]
-    if COOKIE_BANNER_PATTERN.search(head) and not CATALOG_CONTENT_PATTERN.search(markdown):
+    if COOKIE_BANNER_PATTERN.search(head):
         return True
     return False
+
+
+# Akapity PR wydziału (rankingi, nagrody) — wycinane przed ekstrakcją; zawór przy utracie >15% tekstu.
+FACULTY_PROMO_PARAGRAPH_PATTERN = re.compile(
+    r"(wyróżnienie\s+w\s+rankingu|builder\s+ranking|"
+    r"otrzymał[ao]?\s+(?:to\s+)?(?:prestiżowe\s+)?wyróżnienie|"
+    r"dziekan\s+wydziału|jako\s+jedyn[yae]\s+spośród\s+uczelni)",
+    re.I,
+)
+PROMO_FILTER_MIN_RETAINED_RATIO = 0.85
+# Przy filtrze linii — akapit z crawl4ai bywa ogromny; ratio nie ma sensu, pilnujemy markerów treści.
+PROMO_CONTENT_MARKERS = ("zł", "semestr", "czas trwania", "opłat", "stacjonarn", "niestacjonarn", "licencjat", "inżynier")
+
+OPIS_PROMO_WARNING_PATTERN = re.compile(
+    r"(builder\s+ranking|wyróżnienie\s+w\s+rankingu|dziekan\s+wydziału)",
+    re.I,
+)
+
+
+def _markdown_lost_critical_content(original: str, filtered: str) -> bool:
+    """True gdy po filtrze zniknęły fragmenty ważne dla czesne/semestry/tryb."""
+    orig = original.lower()
+    filt = filtered.lower()
+    for marker in PROMO_CONTENT_MARKERS:
+        if marker in orig and marker not in filt:
+            return True
+    return False
+
+
+def _strip_promo_from_line(line: str) -> tuple[str, int]:
+    """Usuwa linię lub pojedyncze zdania z PR — nie cały długi blok markdownu."""
+    if not FACULTY_PROMO_PARAGRAPH_PATTERN.search(line):
+        return line, 0
+    if len(line) <= 500:
+        return "", 1
+    sentences = re.split(r"(?<=[.!?…])\s+", line)
+    kept = [s for s in sentences if s and not FACULTY_PROMO_PARAGRAPH_PATTERN.search(s)]
+    removed = len(sentences) - len(kept)
+    if not kept:
+        return "", max(removed, 1)
+    return " ".join(kept), removed
+
+
+def prepare_markdown_for_extraction(markdown: str) -> str:
+    """Usuwa linie/zdania z oczywistym PR wydziału; przy utracie kluczowej treści zwraca oryginał."""
+    if not markdown:
+        return markdown
+
+    original_len = len(markdown)
+    kept: List[str] = []
+    removed = 0
+    for line in markdown.split("\n"):
+        cleaned, n = _strip_promo_from_line(line)
+        removed += n
+        if cleaned:
+            kept.append(cleaned)
+
+    if not removed:
+        return markdown
+
+    filtered = "\n".join(kept)
+    if _markdown_lost_critical_content(markdown, filtered):
+        print(
+            f"⚠️ Filtr PR wydziału usunął {removed} linii, ale zniknęły dane oferty "
+            "— używam oryginalnego markdownu."
+        )
+        return markdown
+
+    retained_ratio = len(filtered) / original_len if original_len else 1.0
+    if retained_ratio < PROMO_FILTER_MIN_RETAINED_RATIO:
+        print(
+            f"⚠️ Filtr PR wydziału usunął {removed} linii, ale zostawił "
+            f"{retained_ratio:.0%} tekstu — używam oryginalnego markdownu."
+        )
+        return markdown
+
+    print(
+        f"ℹ️ Filtr PR wydziału: usunięto {removed} linii "
+        f"({original_len} → {len(filtered)} znaków)."
+    )
+    return filtered
+
+
+def _warn_if_opis_looks_like_promo(kierunek: KierunekStudiow, url: str) -> None:
+    if OPIS_PROMO_WARNING_PATTERN.search(kierunek.opis):
+        print(f"⚠️ Pole 'opis' może zawierać treść PR wydziału (sprawdź ręcznie): {url}")
+
+
+FEE_SIGNAL_PATTERN = re.compile(
+    r"(czesne|opłat|cena za rok|\b\d+\s*rat\b|/semestr)",
+    re.I,
+)
+FEE_AMOUNT_PATTERN = re.compile(r"\d[\d\s,.]*\s*zł", re.I)
+
+
+def _text_has_fee_signals(text: str) -> bool:
+    if not text:
+        return False
+    return bool(FEE_AMOUNT_PATTERN.search(text) and FEE_SIGNAL_PATTERN.search(text))
+
+
+def _html_to_plain_fragment(html_fragment: str) -> str:
+    text = re.sub(r"<script[^>]*>.*?</script>", " ", html_fragment, flags=re.S | re.I)
+    text = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.S | re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _extract_fee_sections_from_html(html: str) -> str:
+    """Wyciąga tekst cennika z HTML, gdy markdown go pomija (np. karuzele AJAX ideis)."""
+    if not html:
+        return ""
+
+    chunks: List[str] = []
+    for match in re.finditer(
+        r'class="all-tuitions[^"]*"[^>]*data-year="(\d+)"[^>]*>(.*?)</div>\s*</div>',
+        html,
+        re.S | re.I,
+    ):
+        plain = _html_to_plain_fragment(match.group(2))
+        if _text_has_fee_signals(plain):
+            chunks.append(f"[Opłaty rok {match.group(1)}] {plain[:1200]}")
+
+    for match in re.finditer(r'class="mode-tab"[^>]*>(.*?)</div>\s*</div>\s*</div>', html, re.S | re.I):
+        plain = _html_to_plain_fragment(match.group(1))
+        if _text_has_fee_signals(plain) and len(plain) > 40:
+            chunks.append(plain[:1500])
+
+    for match in re.finditer(r'class="bottom__prices"[^>]*>(.*?)</div>', html, re.S | re.I):
+        plain = _html_to_plain_fragment(match.group(1))
+        if plain and FEE_AMOUNT_PATTERN.search(plain):
+            chunks.append(f"[Cena od] {plain}")
+
+    if not chunks:
+        for match in re.finditer(r".{0,40}(czesne|cennik|opłaty).{0,2500}", html, re.I | re.S):
+            plain = _html_to_plain_fragment(match.group())
+            if _text_has_fee_signals(plain):
+                chunks.append(plain[:1500])
+                break
+
+    if not chunks:
+        return ""
+    return "## Sekcja opłat (z HTML strony)\n" + "\n\n".join(dict.fromkeys(chunks))
+
+
+def augment_markdown_with_fee_content(markdown: str, html: str) -> str:
+    """Dokleja cennik z HTML, gdy markdown nie zawiera kwot (typowe dla ideis / sliderów)."""
+    if _text_has_fee_signals(markdown):
+        return markdown
+    snippet = _extract_fee_sections_from_html(html)
+    if not snippet:
+        return markdown
+    print("ℹ️ Markdown bez opłat — doklejam sekcję cennika z HTML.")
+    return f"{markdown.rstrip()}\n\n---\n{snippet}\n"
+
+
+def _parse_ideis_tuition_block(plain: str, mode_label: str, year: str) -> Optional[CzesneEntry]:
+    roczna = re.search(
+        r"1 rata\s+(\d[\d\s]*)\s*zł[^0-9]{0,120}Cena za rok:\s*(\d[\d\s]*)\s*zł",
+        plain,
+        re.I,
+    )
+    if roczna:
+        amount = re.sub(r"\s", "", roczna.group(2))
+        wariant = f"{mode_label} rok {year}".strip()
+        return CzesneEntry(wariant=wariant[:100], kwota=f"{amount} zł/rok")
+
+    if re.search(r"\b1 rata\b", plain, re.I):
+        rok = re.search(r"Cena za rok:\s*(\d[\d\s]*)\s*zł", plain, re.I)
+        if rok:
+            amount = re.sub(r"\s", "", rok.group(1))
+            wariant = f"{mode_label} rok {year}".strip()
+            return CzesneEntry(wariant=wariant[:100], kwota=f"{amount} zł/rok")
+
+    low = re.search(r"Najniższa cena z ostatnich 30 dni:\s*(\d[\d\s]*)\s*zł", plain, re.I)
+    if low:
+        amount = re.sub(r"\s", "", low.group(1))
+        try:
+            if int(amount) > 2500:
+                return None
+        except ValueError:
+            pass
+        wariant = f"{mode_label} rok {year}".strip()
+        return CzesneEntry(wariant=wariant[:100], kwota=f"{amount} zł/mies")
+    return None
+
+
+def extract_czesne_from_html(html: str) -> Optional[List[CzesneEntry]]:
+    """Deterministyczny fallback cennika — ideis (.all-tuitions) i ogólne sekcje opłat."""
+    if not html or not _text_has_fee_signals(html):
+        return None
+
+    entries: List[CzesneEntry] = []
+    seen_keys: set[tuple[str, str]] = set()
+
+    for tab_match in re.finditer(
+        r'class="mode-tab"[^>]*>(.*?)(?=class="mode-tab"|class="bottom__prices"|\Z)',
+        html,
+        re.S | re.I,
+    ):
+        tab_html = tab_match.group(1)
+        title_match = re.search(
+            r'mode-tab__mode-title[^>]*>.*?<span>([^<]+)</span>',
+            tab_html,
+            re.S | re.I,
+        )
+        mode_label = _html_to_plain_fragment(title_match.group(1)) if title_match else "Opłaty"
+        for tu_match in re.finditer(
+            r'class="all-tuitions[^"]*"[^>]*data-year="(\d+)"[^>]*>(.*?)</div>\s*</div>',
+            tab_html,
+            re.S | re.I,
+        ):
+            plain = _html_to_plain_fragment(tu_match.group(2))
+            entry = _parse_ideis_tuition_block(plain, mode_label, tu_match.group(1))
+            if not entry:
+                continue
+            key = (entry.wariant.strip(), entry.kwota.strip())
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            entries.append(entry)
+
+    if not entries:
+        snippet = _extract_fee_sections_from_html(html)
+        if snippet:
+            for line in snippet.splitlines():
+                low = re.search(r"Najniższa cena z ostatnich 30 dni:\s*(\d[\d\s]*)\s*zł", line, re.I)
+                rok = re.search(r"Cena za rok:\s*(\d[\d\s]*)\s*zł", line, re.I)
+                year_match = re.search(r"\[Opłaty rok (\d+)\]", line)
+                wariant = f"Opłaty rok {year_match.group(1)}" if year_match else "Opłaty"
+                if rok:
+                    amount = re.sub(r"\s", "", rok.group(1))
+                    entry = CzesneEntry(wariant=wariant, kwota=f"{amount} zł/rok")
+                elif low:
+                    amount = re.sub(r"\s", "", low.group(1))
+                    entry = CzesneEntry(wariant=wariant, kwota=f"{amount} zł/mies")
+                else:
+                    continue
+                key = (entry.wariant.strip(), entry.kwota.strip())
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                entries.append(entry)
+
+    return entries[:10] if entries else None
+
+
+INSTALLMENT_CZESNE_PATTERN = re.compile(
+    r"(rata|ratal|płatność w \d+ rat|"
+    r"\d+\s*[x×]\s*\d|"
+    r"miesięczn|"
+    r"za rok akademicki|opłata roczna|rocznie)",
+    re.I,
+)
+SEMESTER_WARIANT_PATTERN = re.compile(
+    r"(za semestr|semestral|/semestr|płatność za semestr)",
+    re.I,
+)
+HAS_SEMESTER_UNIT_PATTERN = re.compile(r"/\s*semestr|za\s+semestr", re.I)
+
+
+def _is_installment_czesne_entry(entry: CzesneEntry) -> bool:
+    return bool(INSTALLMENT_CZESNE_PATTERN.search(f"{entry.wariant} {entry.kwota}"))
+
+
+def _ensure_semester_unit(entry: CzesneEntry) -> CzesneEntry:
+    kwota = entry.kwota.strip()
+    if HAS_SEMESTER_UNIT_PATTERN.search(kwota) or not re.search(r"\d", kwota):
+        return entry
+    if SEMESTER_WARIANT_PATTERN.search(entry.wariant) and re.search(r"zł", kwota, re.I):
+        kwota_clean = kwota.rstrip(".")
+        return CzesneEntry(wariant=entry.wariant, kwota=f"{kwota_clean}/semestr")
+    return entry
+
+
+def normalize_czesne(entries: Optional[List[CzesneEntry]]) -> Optional[List[CzesneEntry]]:
+    """Usuwa raty, deduplikuje wpisy, uzupełnia /semestr — przy pustej liście zwraca oryginał."""
+    if not entries:
+        return entries
+
+    original_count = len(entries)
+    filtered = [e for e in entries if not _is_installment_czesne_entry(e)]
+    if not filtered:
+        filtered = list(entries)
+
+    seen: set[tuple[str, str]] = set()
+    deduped: List[CzesneEntry] = []
+    for entry in filtered:
+        key = (entry.wariant.strip(), entry.kwota.strip())
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(_ensure_semester_unit(entry))
+
+    if len(deduped) < original_count:
+        print(f"ℹ️ Czesne: {original_count} → {len(deduped)} wpisów po normalizacji.")
+
+    return deduped if deduped else entries
+
+
+OFFER_ZONE_CONTACT_PATTERN = re.compile(
+    r"kontakt dla kandydata|podkomisji rekrutacyjnej|kontakt rekrutacyjny",
+    re.I,
+)
+TRYB_STACJONARNE_PATTERN = re.compile(r"stacjonarn", re.I)
+TRYB_NIESTACJONARNE_PATTERN = re.compile(r"niestacjonarn|zaoczn|wieczorow", re.I)
+OFFER_ZONE_MAX_CHARS = 6000
+
+
+def _offer_zone_markdown(markdown: str) -> str:
+    """Górna część strony — opis oferty, przed sekcją kontaktu rekrutacyjnego wydziału."""
+    match = OFFER_ZONE_CONTACT_PATTERN.search(markdown)
+    if match:
+        return markdown[: match.start()]
+    return markdown[:OFFER_ZONE_MAX_CHARS]
+
+
+def normalize_tryb(
+    tryb: List[Literal["stacjonarne", "niestacjonarne"]],
+    markdown: str,
+) -> List[Literal["stacjonarne", "niestacjonarne"]]:
+    """Koryguje tryb tylko gdy LLM dodał drugi tryb z kontaktu, a nagłówek wskazuje jeden."""
+    if len(tryb) <= 1:
+        return tryb
+
+    zone = _offer_zone_markdown(markdown)
+    has_stacjonarne = bool(TRYB_STACJONARNE_PATTERN.search(zone))
+    has_niestacjonarne = bool(TRYB_NIESTACJONARNE_PATTERN.search(zone))
+
+    if has_stacjonarne and not has_niestacjonarne:
+        print("ℹ️ Tryb: skorygowano do stacjonarne (strefa oferty wskazuje jeden tryb).")
+        return ["stacjonarne"]
+    if has_niestacjonarne and not has_stacjonarne:
+        print("ℹ️ Tryb: skorygowano do niestacjonarne (strefa oferty wskazuje jeden tryb).")
+        return ["niestacjonarne"]
+    return tryb
 
 
 def extract_with_llm(text: str) -> KierunekStudiow:
@@ -255,9 +754,15 @@ def extract_with_llm(text: str) -> KierunekStudiow:
         "Wynika ze stopnia i profilu: licencjat lub inżynier (1_stopnia), "
         "magister (2_stopnia / jednolite_magisterskie).\n\n"
         "## POLE 'tryb'\n"
-        "Tryby WYŁĄCZNIE tej oferty. Źródło: podtytuł lub nagłówek bezpośrednio pod nazwą kierunku. "
-        "Jeden tryb → tablica z jednym elementem. Dwa tryby tylko gdy strona wprost stwierdza "
-        "dostępność w obu dla TEJ SAMEJ oferty. NIE wyciągaj ze stopek ani sekcji kontaktowych.\n\n"
+        "Tryby WYŁĄCZNIE tej konkretnej oferty (tego URL) — nie całego wydziału ani uczelni.\n"
+        "Priorytet źródeł: linia bezpośrednio pod H1 / nazwą kierunku (np. 'Stacjonarne Studia I stopnia…') → "
+        "metadane oferty tuż pod tytułem (forma studiów, tryb).\n"
+        "Jeden tryb w nagłówku oferty → tablica z jednym elementem, nawet gdy niżej w kontakcie wydziału "
+        "wspomniano inny tryb.\n"
+        "Dwa tryby tylko gdy w strefie oferty (pod H1) wprost widać oba dla TEJ SAMEJ strony.\n"
+        "KATEGORYCZNIE NIE używaj do trybu: sekcji 'Kontakt dla kandydata', podkomisji rekrutacyjnych, "
+        "e-maili/telefonów rekrutacji, stopek wydziału, legend filtrów katalogu.\n"
+        "Mapowanie: 'zaoczne', 'wieczorowe' → niestacjonarne.\n\n"
         "## POLE 'semestry'\n"
         "Szukaj AKTYWNIE w całym tekście: 'N semestrów', 'N lat' (pomnóż × 2), "
         "'czas trwania: N', tabela planu studiów (policz semestry). "
@@ -278,12 +783,26 @@ def extract_with_llm(text: str) -> KierunekStudiow:
         "## POLE 'czesne' — KATEGORYCZNY ZAKAZ ZMYŚLANIA\n"
         "Podaj opłaty TYLKO jeśli konkretne kwoty fizycznie znajdują się w dostarczonym tekście. "
         "Jeśli tekst nie zawiera żadnej kwoty — zwróć null, nie zgaduj.\n"
-        "Jeśli kwoty są — każdy wiersz tabeli to osobny obiekt {wariant, kwota}:\n"
-        "  wariant: opis (np. 'stacjonarne', 'niestacjonarne', 'I stopień stacjonarne')\n"
-        "  kwota: przepisz DOSŁOWNIE z tekstu (np. '2400 zł/semestr')\n"
-        "NIGDY nie uśredniaj, nie interpretuj, nie wymyślaj — tylko to co jest w tekście.\n\n"
+        "Źródło: wyłącznie sekcja cennika / opłat za TEN kierunek. "
+        "Ignoruj stypendia, ulgi, opłaty rekrutacyjne i wpisowe (chyba że to jedyna kwota).\n\n"
+        "NORMALIZACJA (bez zmiany liczb, bez uśredniania):\n"
+        "- Preferuj opłatę za SEMESTR ('NNNN zł/semestr'), gdy strona podaje ją wprost.\n"
+        "- Gdy strona ma TYLKO raty miesięczne lub roczne — wpisz je dosłownie (np. '599 zł/mies', "
+        "'6920 zł/rok'). NIE zwracaj null tylko dlatego, że brak etykiety 'za semestr'.\n"
+        "- Pomiń pełną macierz rat (12 rat, 10 rat, …) — max 1 reprezentatywny wariant na tryb×rok "
+        "(np. 'Najniższa cena z ostatnich 30 dni' albo '1 rata' / 'Cena za rok').\n"
+        "- wariant: krótko, np. 'stacjonarne I rok', 'Czesne równe rok 2' — bez kopiowania całej etykiety.\n"
+        "- Gdy tabela ma podział na lata (I rok, II rok…): jeden wpis na rok × tryb, gdy kwoty się różnią.\n"
+        "- Cel: zwykle 2–10 sensownych wpisów.\n"
+        "NIGDY nie uśredniaj, nie przeliczaj rat na semestr, nie wymyślaj — tylko to co jest w tekście.\n\n"
         "## POLE 'opis'\n"
-        "2-3 zdania o profilu, charakterze i perspektywach — wyłącznie na podstawie tekstu.\n\n"
+        "2-3 zdania o profilu PROGRAMU studiów: czego się uczysz, jaki charakter ma kształcenie, "
+        "perspektywy zawodowe — wyłącznie na podstawie tekstu strony.\n"
+        "Priorytet źródeł: wstęp pod nagłówkiem H1 → sekcje Program / profil kierunku / "
+        "'Ten program jest dla Ciebie' / 'Co możesz robić po studiach'.\n"
+        "KATEGORYCZNIE NIE używaj do opisu: rankingów uczelni, nagród i wyróżnień wydziału, "
+        "aktualności, cytatów dziekana, karuzel 'dlaczego warto', jeśli dotyczą prestiżu "
+        "uczelni/wydziału, a nie treści programu.\n\n"
         "Ignoruj nawigację, stopki, bannery cookie i reklamy.\n"
         "Zwróć WYŁĄCZNIE poprawny obiekt JSON. Żadnych komentarzy ani dodatkowego tekstu.\n\n"
         f"Tekst strony:\n{text}"
@@ -296,7 +815,10 @@ def extract_with_llm(text: str) -> KierunekStudiow:
             "temperature": 0.0,
         },
     )
-    return KierunekStudiow.model_validate_json(response_text)
+    kierunek = KierunekStudiow.model_validate_json(response_text)
+    kierunek.czesne = normalize_czesne(kierunek.czesne)
+    kierunek.tryb = normalize_tryb(kierunek.tryb, text)
+    return kierunek
 
 
 async def get_course_links(url: str, crawler: AsyncWebCrawler) -> List[str]:
@@ -304,9 +826,8 @@ async def get_course_links(url: str, crawler: AsyncWebCrawler) -> List[str]:
     run_config = CrawlerRunConfig(
         cache_mode=CacheMode.BYPASS,
         word_count_threshold=5,
-        delay_before_return_html=4.0,
+        delay_before_return_html=5.0,
         magic=True,
-        remove_consent_popups=True,
         js_code_before_wait=CATALOG_JS_PREP,
         js_code=CATALOG_JS_SCROLL,
     )
@@ -366,11 +887,16 @@ async def get_course_links(url: str, crawler: AsyncWebCrawler) -> List[str]:
     ]
     links = [
         u for u in links
-        if u.startswith(("http://", "https://")) and not _is_junk_url(u)
+        if u.startswith(("http://", "https://")) and _is_course_detail_url(u, catalog_url=url)
     ]
     links = list(dict.fromkeys(links))
     if raw_count and not links:
         print(f"⚠️ Gemini zwrócił {raw_count} linków, ale post-filter odrzucił wszystkie.")
+    if not links:
+        fallback = _extract_course_links_from_crawl(result, url, catalog_url=url)
+        if fallback:
+            print(f"ℹ️ Fallback HTML: znaleziono {len(fallback)} linków kierunków.")
+            links = fallback
     if not links and _catalog_markdown_looks_js_blocked(md):
         print(
             "⚠️ 0 linków — prawdopodobnie katalog ładuje kierunki przez JavaScript/AJAX "
@@ -399,6 +925,8 @@ async def run_spider(request: ScrapeRequest):
         word_count_threshold=10,
         delay_before_return_html=5.0,
         magic=True,
+        js_code_before_wait=COURSE_JS_PREP,
+        js_code=COURSE_JS_SCROLL,
         excluded_tags=["nav", "footer", "header", "script", "style", "form"],
         exclude_external_links=True,
     )
@@ -420,9 +948,25 @@ async def run_spider(request: ScrapeRequest):
                 continue
 
             md = result.markdown or ""
+            html = getattr(result, "html", None) or getattr(result, "cleaned_html", None) or ""
             print(f"  📄 Markdown: {len(md)} znaków")
             try:
+                md = prepare_markdown_for_extraction(md)
+                md = augment_markdown_with_fee_content(md, html)
                 kierunek = await asyncio.to_thread(extract_with_llm, md)
+                if not kierunek.czesne:
+                    fallback_czesne = extract_czesne_from_html(html)
+                    if fallback_czesne:
+                        kierunek.czesne = normalize_czesne(fallback_czesne)
+                        print(
+                            f"ℹ️ Czesne uzupełnione z HTML "
+                            f"({len(kierunek.czesne or [])} wpisów)."
+                        )
+                    elif _text_has_fee_signals(md):
+                        print(
+                            f"⚠️ Tekst zawiera opłaty, ale LLM zwrócił null dla czesne: {url}"
+                        )
+                _warn_if_opis_looks_like_promo(kierunek, url)
                 results.append(ScrapeResultItem(url=url, data=kierunek))
                 print(f"✅ [{i}/{MAX_COURSES_PER_RUN}] {kierunek.kierunek} | {kierunek.stopien} | {'/'.join(kierunek.tryb)}")
             except GeminiQuotaError as e:
