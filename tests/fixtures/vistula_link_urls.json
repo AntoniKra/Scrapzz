@@ -1,0 +1,19 @@
+{
+  "_comment": "Vistula (AFiB): hub /kierunki-studiow — kierunki vs hub-root vs nawigacja vs śmieci",
+  "catalog_url": "https://vistula.edu.pl/oferta-edukacyjna/i-stopnia-licencjackie",
+  "hub_url": "https://vistula.edu.pl/kierunki-studiow",
+  "course_urls": [
+    "https://vistula.edu.pl/kierunki-studiow/administracja-w-warszawie",
+    "https://vistula.edu.pl/kierunki-studiow/ekonomia",
+    "https://vistula.edu.pl/kierunki-studiow/informatyka-i-ekonometria"
+  ],
+  "hub_urls": [
+    "https://vistula.edu.pl/kierunki-studiow"
+  ],
+  "rejected_urls": [
+    "https://vistula.edu.pl/oferta-edukacyjna/i-stopnia-licencjackie",
+    "https://vistula.edu.pl/kontakt",
+    "https://vistula.edu.pl/oferta-edukacyjna/studia-podyplomowe",
+    "https://vistula.edu.pl/oferta-edukacyjna/mba"
+  ]
+}

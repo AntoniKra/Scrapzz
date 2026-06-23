@@ -7,7 +7,7 @@ import re
 import threading
 from pathlib import Path
 from typing import List, Optional, Literal
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, parse_qsl, urlencode, urlunparse
 
 from dotenv import load_dotenv
 
@@ -81,7 +81,24 @@ class ScrapeResponse(BaseModel):
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
 GEMINI_MIN_INTERVAL = 4.0
-MAX_COURSES_PER_RUN = 5
+MAX_COURSES_PER_RUN = 10
+
+TRACKING_QUERY_PARAMS = frozenset({
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "gclid", "gbraid", "wbraid", "fbclid", "_gl", "_ga",
+})
+
+
+def _strip_tracking_params(url: str) -> str:
+    """Usuwa znane parametry trackingowe z URL katalogu przed crawlem."""
+    parsed = urlparse(url)
+    if not parsed.query:
+        return url
+    kept = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+            if k.lower() not in TRACKING_QUERY_PARAMS]
+    new_query = urlencode(kept)
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+
 
 _gemini_client: Optional[genai.Client] = None
 _last_gemini_call = 0.0
@@ -175,7 +192,7 @@ JUNK_URL_PATTERN = re.compile(
 
 COURSE_PATH_PATTERN = re.compile(
     r"(oferta-studiow|/kierunek/|pokazKierunek|/studia/|/program/|/oferta/studia|"
-    r"studia-i-stopnia/|studia-ii-stopnia/)",
+    r"studia-i-stopnia/|studia-ii-stopnia/|/kierunki-studiow/[^/?#]+)",
     re.I,
 )
 
@@ -185,7 +202,8 @@ CATALOG_PAGE_PATTERN = re.compile(
     r"(?:^|/)studia-i-stopnia/?(?:\?|#|$)|"
     r"(?:^|/)studia-ii-stopnia/?(?:\?|#|$)|"
     r"(?:^|/)strona-\d+/?(?:\?|#|$)|"
-    r"(?:^|/)page/\d+/?(?:\?|#|$))",
+    r"(?:^|/)page/\d+/?(?:\?|#|$)|"
+    r"(?:^|/)kierunki-studiow/?(?:\?|#|$))",
     re.I,
 )
 
@@ -230,7 +248,7 @@ COOKIE_BANNER_PATTERN = re.compile(
 )
 CATALOG_CONTENT_PATTERN = re.compile(
     r"(card_post|filter-results|kierunek studiów|/oferta/studia-|/kierunek/|"
-    r"oferta-studiow/[^/\s]+|invulstructure|studia-i-stopnia/)",
+    r"oferta-studiow/[^/\s]+|invulstructure|studia-i-stopnia/|/kierunki-studiow/[^)\s\"'<]+)",
     re.I,
 )
 
@@ -275,6 +293,11 @@ CATALOG_JS_PREP = """
       const href = a.getAttribute('href') || '';
       if (/oferta-studiow\\/strona/i.test(href)) continue;
       if (/oferta-studiow\\/.+/i.test(href) || /\\/kierunek\\//i.test(href)) return true;
+    }
+    // Vistula: kierunki są pod /kierunki-studiow/<slug>
+    for (const a of document.querySelectorAll('a[href*="/kierunki-studiow/"]')) {
+      const href = a.getAttribute('href') || '';
+      if (/\\/kierunki-studiow\\/[^/?#]+/i.test(href)) return true;
     }
     return false;
   };
@@ -851,32 +874,74 @@ def extract_with_llm(text: str) -> tuple[KierunekStudiow, List[str]]:
     return kierunek, warnings
 
 
-async def get_course_links(url: str, crawler: AsyncWebCrawler) -> List[str]:
-    print(f"🔍 Pobieram katalog kierunków: {url}")
-    run_config = CrawlerRunConfig(
-        cache_mode=CacheMode.BYPASS,
-        word_count_threshold=5,
-        delay_before_return_html=5.0,
-        magic=True,
-        js_code_before_wait=CATALOG_JS_PREP,
-        js_code=CATALOG_JS_SCROLL,
-    )
-    result = await crawler.arun(url=url, config=run_config)
-    if not result.success:
-        print(f"❌ Nie udało się pobrać katalogu: {result.error_message}")
-        return []
+_HUB_LINK_TEXTS = re.compile(
+    r"(zobacz wszystkie dostępne kierunki|wszystkie dostępne kierunki|"
+    r"lista kierunków|kierunki studiów)",
+    re.I,
+)
+_HUB_PATH_PATTERN = re.compile(r"^/kierunki-studiow/?$", re.I)
 
-    md = result.markdown or ""
-    print(f"📄 Markdown ze strony: {len(md)} znaków")
-    print(f"📄 Podgląd (pierwsze 500 znaków):\n{md[:500]}\n---")
-    if _catalog_markdown_looks_js_blocked(md):
-        print(
-            "⚠️ Markdown katalogu wygląda na pusty lub zablokowany (cookie/JS). "
-            "Treść kierunków mogła się nie załadować."
-        )
 
+def _extract_catalog_hub_url(result, base_url: str, current_url: str) -> Optional[str]:
+    """Wykrywa link-hub do właściwego katalogu kierunków (np. Vistula /kierunki-studiow).
+
+    Zwraca URL tylko gdy: ten sam host, ścieżka = /kierunki-studiow, tekst linku to znana fraza.
+    """
+    base_host = urlparse(base_url).netloc.lower()
+    # Preferuj result.links (crawl4ai parsuje <a> z tekstem)
+    links_obj = getattr(result, "links", None) or {}
+    if isinstance(links_obj, dict):
+        for bucket in ("internal", "external"):
+            for item in links_obj.get(bucket, []) or []:
+                if not isinstance(item, dict):
+                    continue
+                href = item.get("href", "") or ""
+                text = item.get("text", "") or ""
+                if not href:
+                    continue
+                full = urljoin(base_url, href)
+                parsed = urlparse(full)
+                if parsed.netloc.lower() != base_host:
+                    continue
+                if _HUB_PATH_PATTERN.match(parsed.path):
+                    if _HUB_LINK_TEXTS.search(text.strip()):
+                        return full
+    # Fallback: regex na HTML — <a href="...kierunki-studiow...">tekst</a>
+    html = getattr(result, "html", None) or getattr(result, "cleaned_html", None) or ""
+    if html:
+        for m in re.finditer(
+            r'<a[^>]+href=["\']([^"\']*kierunki-studiow/?)["\'][^>]*>(.*?)</a>',
+            html, re.I | re.S,
+        ):
+            href, text = m.group(1), re.sub(r"<[^>]+>", "", m.group(2))
+            if not _HUB_LINK_TEXTS.search(text.strip()):
+                continue
+            full = urljoin(base_url, href)
+            parsed = urlparse(full)
+            if parsed.netloc.lower() == base_host and _HUB_PATH_PATTERN.match(parsed.path):
+                return full
+    return None
+
+
+def _collect_links_from_crawl_result(
+    result,
+    crawl_url: str,
+    catalog_url: str,
+) -> tuple[list[str], list[str]]:
+    """Zwraca (gemini_links, html_links) dla jednego crawla.
+
+    gemini_links: lista po call_gemini_with_retry (caller podaje gotową listę).
+    html_links:   lista z _extract_course_links_from_crawl po filtrze.
+    Funkcja obsługuje tylko html_links — gemini_links są przekazywane z zewnątrz.
+    """
+    html_links = _extract_course_links_from_crawl(result, crawl_url, catalog_url=catalog_url)
+    return html_links
+
+
+def _gemini_links_from_markdown(md: str, base_url: str, catalog_url: str) -> tuple[list[str], int]:
+    """Wysyła markdown do Gemini, zwraca (przefiltrowane_linki, raw_count)."""
     prompt = (
-        f"Analizujesz stronę katalogu: {url}\n\n"
+        f"Analizujesz stronę katalogu: {base_url}\n\n"
         "Jesteś rygorystycznym filtrem linków dla agregatora kierunków studiów. "
         "Twoim JEDYNYM zadaniem jest zwrócić tablicę JSON z linkami prowadzącymi "
         "WYŁĄCZNIE do stron ze szczegółowym opisem KONKRETNEGO, nazwanego kierunku studiów "
@@ -899,39 +964,124 @@ async def get_course_links(url: str, crawler: AsyncWebCrawler) -> List[str]:
         "Żadnych komentarzy, wyjaśnień ani dodatkowego tekstu.\n\n"
         f"Tekst strony:\n{md}"
     )
-    response_text = await asyncio.to_thread(
-        call_gemini_with_retry,
+    response_text = call_gemini_with_retry(
         prompt,
         {"response_mime_type": "application/json", "temperature": 0.0},
     )
-    print(f"🤖 Surowa odpowiedź Gemini: {response_text!r}")
     try:
-        parsed = json.loads(response_text)
+        parsed_resp = json.loads(response_text)
     except json.JSONDecodeError:
-        parsed = []
-    links: List[str] = parsed if isinstance(parsed, list) else parsed.get("links", [])
-    raw_count = len(links)
-    links = [
-        urljoin(url, u) for u in links
-        if isinstance(u, str) and u.strip()
-    ]
+        parsed_resp = []
+    raw: List[str] = parsed_resp if isinstance(parsed_resp, list) else parsed_resp.get("links", [])
+    raw_count = len(raw)
+    links = [urljoin(base_url, u) for u in raw if isinstance(u, str) and u.strip()]
     links = [
         u for u in links
-        if u.startswith(("http://", "https://")) and _is_course_detail_url(u, catalog_url=url)
+        if u.startswith(("http://", "https://")) and _is_course_detail_url(u, catalog_url=catalog_url)
     ]
-    links = list(dict.fromkeys(links))
-    if raw_count and not links:
-        print(f"⚠️ Gemini zwrócił {raw_count} linków, ale post-filter odrzucił wszystkie.")
-    if not links:
-        fallback = _extract_course_links_from_crawl(result, url, catalog_url=url)
-        if fallback:
-            print(f"ℹ️ Fallback HTML: znaleziono {len(fallback)} linków kierunków.")
-            links = fallback
-    if not links and _catalog_markdown_looks_js_blocked(md):
+    return list(dict.fromkeys(links)), raw_count
+
+
+def _merge_links(gemini_links: list[str], html_links: list[str]) -> list[str]:
+    """Merge Gemini (priorytet) + HTML z bezpiecznikiem przeciw zalewaniu DOM-śmieciami."""
+    g = len(gemini_links)
+    h = len(html_links)
+    if h > 150 or (g > 0 and h > 10 * g):
         print(
-            "⚠️ 0 linków — prawdopodobnie katalog ładuje kierunki przez JavaScript/AJAX "
-            "(np. WordPress + filtr). Sprawdź, czy w markdownie widać karty kierunków."
+            f"ℹ️ Bezpiecznik merge: html={h} przy gemini={g} — używam tylko Gemini."
         )
+        return gemini_links
+    merged = list(dict.fromkeys(gemini_links + html_links))
+    return merged
+
+
+async def _crawl_catalog(url: str, crawler) -> object:
+    """Jeden crawl katalogu ze standardową konfiguracją."""
+    run_config = CrawlerRunConfig(
+        cache_mode=CacheMode.BYPASS,
+        word_count_threshold=5,
+        delay_before_return_html=5.0,
+        magic=True,
+        js_code_before_wait=CATALOG_JS_PREP,
+        js_code=CATALOG_JS_SCROLL,
+    )
+    return await crawler.arun(url=url, config=run_config)
+
+
+async def _links_from_crawl(url: str, crawler) -> tuple[list[str], object]:
+    """Crawl + Gemini + HTML → (final_links, result). Przy błędzie zwraca ([], None)."""
+    result = await _crawl_catalog(url, crawler)
+    if not result.success:
+        print(f"❌ Nie udało się pobrać katalogu {url}: {result.error_message}")
+        return [], None
+
+    md = result.markdown or ""
+    print(f"📄 Markdown ze strony {url}: {len(md)} znaków")
+    print(f"📄 Podgląd (pierwsze 500 znaków):\n{md[:500]}\n---")
+    if _catalog_markdown_looks_js_blocked(md):
+        print("⚠️ Markdown katalogu wygląda na pusty lub zablokowany (cookie/JS).")
+
+    gemini_links, raw_count = await asyncio.to_thread(
+        _gemini_links_from_markdown, md, url, url
+    )
+    print(f"ℹ️ links_gemini={len(gemini_links)} (raw={raw_count})")
+    if raw_count and not gemini_links:
+        print(f"⚠️ Gemini zwrócił {raw_count} linków, ale post-filter odrzucił wszystkie.")
+
+    html_links = _extract_course_links_from_crawl(result, url, catalog_url=url)
+    print(f"ℹ️ links_html={len(html_links)}")
+
+    if gemini_links:
+        final = _merge_links(gemini_links, html_links)
+    else:
+        # HTML fallback gdy Gemini = 0
+        final = html_links
+        if html_links:
+            print(f"ℹ️ Fallback HTML: {len(html_links)} linków.")
+
+    return final, result
+
+
+async def get_course_links(url: str, crawler: AsyncWebCrawler) -> List[str]:
+    url = _strip_tracking_params(url)
+    print(f"🔍 Pobieram katalog kierunków: {url}")
+
+    links, result = await _links_from_crawl(url, crawler)
+
+    # ── Hub detection — katalog-pośrednik (np. Vistula /oferta-edukacyjna/...) ──
+    hub_url: Optional[str] = None
+    if len(links) < 20 and result is not None:
+        hub_url = _extract_catalog_hub_url(result, url, url)
+        if hub_url:
+            hub_url = _strip_tracking_params(hub_url)
+            print(f"ℹ️ hub_url={hub_url} — wykonuję dodatkowy crawl katalogu głównego.")
+            try:
+                hub_links, _ = await _links_from_crawl(hub_url, crawler)
+                print(f"ℹ️ links_hub={len(hub_links)}")
+                if len(hub_links) > len(links):
+                    links = hub_links
+                    print("ℹ️ Używam wyników z hub_url (więcej kierunków).")
+                else:
+                    print("ℹ️ Hub nie poprawił wyniku — zostaję przy URL wejściowym.")
+            except Exception as e:
+                print(f"⚠️ Hub crawl nieudany ({hub_url}): {e} — zostaję przy URL wejściowym.")
+        else:
+            print("ℹ️ hub_url=brak")
+
+    if not links and result is not None:
+        md = getattr(result, "markdown", "") or ""
+        if _catalog_markdown_looks_js_blocked(md):
+            print(
+                "⚠️ 0 linków — prawdopodobnie katalog ładuje kierunki przez JavaScript/AJAX "
+                "(np. WordPress + filtr). Sprawdź, czy w markdownie widać karty kierunków."
+            )
+
+    print(f"ℹ️ final_links={len(links)}")
+    if links:
+        sample = links[:20]
+        print("ℹ️ Pierwsze 20 linków:")
+        for i, lnk in enumerate(sample, 1):
+            print(f"   {i:2}. {lnk}")
     print(f"✅ Znaleziono {len(links)} linków do kierunków.")
     return links
 
