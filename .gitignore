@@ -10,3 +10,6 @@ __pycache__/
 # Frontend (build / cache)
 frontend/node_modules/
 frontend/dist/
+
+# Eksporty preview (generowane lokalnie)
+exports/

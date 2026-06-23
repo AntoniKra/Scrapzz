@@ -81,7 +81,7 @@ class ScrapeResponse(BaseModel):
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
 GEMINI_MIN_INTERVAL = 4.0
-MAX_COURSES_PER_RUN = 10
+MAX_COURSES_PER_RUN = 5
 
 TRACKING_QUERY_PARAMS = frozenset({
     "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
@@ -1097,7 +1097,10 @@ async def health():
 
 @app.post("/api/scrape", response_model=ScrapeResponse)
 async def run_spider(request: ScrapeRequest):
-    catalog_url = str(request.url)
+    return await execute_scrape(str(request.url))
+
+
+async def execute_scrape(catalog_url: str) -> ScrapeResponse:
     print(f"🤖 Gemini model: {GEMINI_MODEL}")
     results: List[ScrapeResultItem] = []
     links: List[str] = []
@@ -1187,6 +1190,32 @@ async def run_spider(request: ScrapeRequest):
         links_processed=len(results),
         results=results,
     )
+
+
+@app.post("/api/scrape/wks-preview")
+async def scrape_wks_preview(request: ScrapeRequest):
+    from wks_mapper import map_scrape_response_to_wks_preview
+
+    scrape_result = await execute_scrape(str(request.url))
+    preview = map_scrape_response_to_wks_preview(scrape_result)
+
+    exports_dir = Path(__file__).resolve().parent / "exports"
+    exports_dir.mkdir(exist_ok=True)
+    out_path = exports_dir / "last_wks_preview.json"
+    out_path.write_text(
+        json.dumps(preview, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    summary = preview["summary"]
+    print(f"📦 WKS preview zapisany: {out_path}")
+    print(
+        f"ℹ️ WKS summary: input={summary['input_results_count']}, "
+        f"wydzialy={summary['wydzialy_count']}, "
+        f"specjalizacje={summary['specjalizacje_count']}, "
+        f"errors={summary['error_results_count']}"
+    )
+    return preview
 
 
 if __name__ == "__main__":
