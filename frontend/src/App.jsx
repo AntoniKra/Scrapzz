@@ -9,7 +9,27 @@ const STOPIEN_LABEL = {
   'jednolite_magisterskie': 'Jednolite magisterskie',
 };
 
-// ── Badge ─────────────────────────────────────────────────────────────────────
+const WARNING_LABELS = {
+  opis_moze_zawierac_pr_wydzialu: 'Opis może zawierać PR wydziału — sprawdź ręcznie',
+  czesne_null_mimo_sygnalow_w_tekscie: 'W tekście są opłaty, ale AI nie zwróciło czesnego',
+  czesne_uzupelnione_z_html_fallback: 'Czesne uzupełnione z HTML (fallback)',
+  tryb_skorygowany_w_normalizacji: 'Tryb skorygowany w normalizacji (np. kontakt wydziału)',
+  cennik_doklejony_do_markdown: 'Cennik doklejony do tekstu z HTML przed analizą AI',
+};
+
+function WarningList({ warnings }) {
+  if (!warnings?.length) return null;
+  return (
+    <ul className="card__warnings" onClick={e => e.stopPropagation()}>
+      {warnings.map(code => (
+        <li key={code} className="card__warning-item">
+          <span className="card__warning-icon" aria-hidden="true">⚠</span>
+          <span>{WARNING_LABELS[code] ?? code}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
 
 function Badge({ children, variant = 'default' }) {
   return <span className={`badge badge--${variant}`}>{children}</span>;
@@ -19,7 +39,7 @@ function Badge({ children, variant = 'default' }) {
 
 function CourseCard({ item }) {
   const [expanded, setExpanded] = useState(false);
-  const { data, url, error } = item;
+  const { data, url, error, warnings } = item;
 
   if (error || !data) {
     return (
@@ -63,6 +83,8 @@ function CourseCard({ item }) {
       </div>
 
       <h2 className="card__title">{data.kierunek}</h2>
+
+      <WarningList warnings={warnings} />
 
       <ul className="card__meta">
         <li>

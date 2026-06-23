@@ -132,6 +132,18 @@ Spider ma wbudowany rate limiting i retry. Przy darmowym planie ogranicz liczbę
 
 Kod ustawia `WindowsProactorEventLoopPolicy` dla Playwright — wymagane na Windows. Uvicorn uruchamia się z `reload=False` na Windows (ograniczenie Playwright + asyncio).
 
+## Testy regresji
+
+Deterministyczne testy filtrów linków, normalizacji i ekstrakcji czesne — **bez** crawla, Gemini i internetu.
+
+```bash
+source venv/Scripts/activate   # Windows Git Bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+Fixture’y w `tests/fixtures/` to małe próbki (URL-e, fragment HTML/markdown) z uczelni referencyjnych.
+
 ## Licencja
 
 Projekt prywatny — repozytorium [AntoniKra/Scrapzz](https://github.com/AntoniKra/Scrapzz).

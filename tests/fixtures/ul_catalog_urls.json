@@ -1,0 +1,11 @@
+{
+  "_comment": "UŁ: strona paginacji katalogu vs pojedynczy kierunek",
+  "catalog_url": "https://www.uni.lodz.pl/rekrutacja/oferta-studiow/strona",
+  "course_urls": [
+    "https://www.uni.lodz.pl/rekrutacja/oferta-studiow/administracja-7"
+  ],
+  "catalog_list_urls": [
+    "https://www.uni.lodz.pl/rekrutacja/oferta-studiow/strona",
+    "https://www.uni.lodz.pl/rekrutacja/oferta-studiow/strona-2"
+  ]
+}

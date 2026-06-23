@@ -1,0 +1,14 @@
+{
+  "_comment": "Próbki URL-i pod regresję hybrid filtra (Ideis). Kontakt i sam katalog odpadają; kierunki przechodzą.",
+  "catalog_url": "https://www.ideis.pl/studia-i-stopnia",
+  "course_urls": [
+    "https://www.ideis.pl/studia-i-stopnia/informatyka",
+    "https://www.ideis.pl/studia-i-stopnia/zarzadzanie",
+    "https://www.ideis.pl/studia-ii-stopnia/psychologia"
+  ],
+  "rejected_urls": [
+    "https://www.ideis.pl/kontakt",
+    "https://www.ideis.pl/studia-i-stopnia",
+    "https://www.ideis.pl/faq"
+  ]
+}

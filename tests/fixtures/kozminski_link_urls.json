@@ -1,0 +1,14 @@
+{
+  "_comment": "Koźmiński: studia-i-stopnia w ścieżce; podyplomówki i kontakt odpadają",
+  "catalog_url": "https://www.kozminski.edu.pl/pl/oferta-edukacyjna/studia-i-stopnia",
+  "course_urls": [
+    "https://www.kozminski.edu.pl/pl/oferta-edukacyjna/studia-i-stopnia/zarzadzanie",
+    "https://www.kozminski.edu.pl/pl/oferta-edukacyjna/studia-i-stopnia/finanse-i-rachunkowosc",
+    "https://www.kozminski.edu.pl/pl/oferta-edukacyjna/studia-ii-stopnia/zarzadzanie"
+  ],
+  "rejected_urls": [
+    "https://www.kozminski.edu.pl/pl/oferta-edukacyjna/studia-podyplomowe",
+    "https://www.kozminski.edu.pl/pl/kontakt",
+    "https://www.kozminski.edu.pl/pl/oferta-edukacyjna/studia-i-stopnia"
+  ]
+}

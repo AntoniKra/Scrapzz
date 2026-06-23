@@ -1,0 +1,14 @@
+{
+  "_comment": "ATA (WordPress): /oferta/studia-1-stopnia/ — katalog vs kierunki vs śmieci",
+  "catalog_url": "https://akademiata.pl/oferta/studia-1-stopnia/",
+  "course_urls": [
+    "https://akademiata.pl/oferta/studia-1-stopnia/grafika/",
+    "https://akademiata.pl/oferta/studia-1-stopnia/architektura-wnetrz/",
+    "https://akademiata.pl/oferta/studia-1-stopnia/zarzadzanie-i-inzynieria-produkcji/"
+  ],
+  "rejected_urls": [
+    "https://akademiata.pl/kontakt",
+    "https://akademiata.pl/aktualnosci",
+    "https://akademiata.pl/oferta/studia-1-stopnia/"
+  ]
+}

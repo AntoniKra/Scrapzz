@@ -68,6 +68,7 @@ class ScrapeResultItem(BaseModel):
     url: str
     data: Optional[KierunekStudiow] = None
     error: Optional[str] = None
+    warnings: List[str] = Field(default_factory=list)
 
 class ScrapeResponse(BaseModel):
     status: str
@@ -82,13 +83,32 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
 GEMINI_MIN_INTERVAL = 4.0
 MAX_COURSES_PER_RUN = 5
 
-_gemini_client = genai.Client()
+_gemini_client: Optional[genai.Client] = None
 _last_gemini_call = 0.0
 _gemini_lock = threading.Lock()
 
 
+class GeminiNotConfiguredError(RuntimeError):
+    """Brak GEMINI_API_KEY — scrapowanie wymaga klucza w .env."""
+
+
 class GeminiQuotaError(RuntimeError):
     """Wyczerpany limit API Gemini — nie retryuj w nieskończoność."""
+
+
+def _gemini_api_key_configured() -> bool:
+    return bool(os.environ.get("GEMINI_API_KEY", "").strip())
+
+
+def _get_gemini_client() -> genai.Client:
+    global _gemini_client
+    if _gemini_client is None:
+        if not _gemini_api_key_configured():
+            raise GeminiNotConfiguredError(
+                "Brak GEMINI_API_KEY w pliku .env w katalogu głównym projektu."
+            )
+        _gemini_client = genai.Client()
+    return _gemini_client
 
 
 def _parse_retry_delay(error: Exception) -> float:
@@ -118,7 +138,7 @@ def call_gemini_with_retry(
                 print(f"⏳ Odstęp Gemini: {gap:.1f}s...")
                 time.sleep(gap)
             try:
-                response = _gemini_client.models.generate_content(
+                response = _get_gemini_client().models.generate_content(
                     model=GEMINI_MODEL,
                     contents=prompt,
                     config=config,
@@ -477,9 +497,11 @@ def prepare_markdown_for_extraction(markdown: str) -> str:
     return filtered
 
 
-def _warn_if_opis_looks_like_promo(kierunek: KierunekStudiow, url: str) -> None:
+def _opis_promo_warning(kierunek: KierunekStudiow, url: str) -> Optional[str]:
     if OPIS_PROMO_WARNING_PATTERN.search(kierunek.opis):
         print(f"⚠️ Pole 'opis' może zawierać treść PR wydziału (sprawdź ręcznie): {url}")
+        return "opis_moze_zawierac_pr_wydzialu"
+    return None
 
 
 FEE_SIGNAL_PATTERN = re.compile(
@@ -714,10 +736,10 @@ def _offer_zone_markdown(markdown: str) -> str:
 def normalize_tryb(
     tryb: List[Literal["stacjonarne", "niestacjonarne"]],
     markdown: str,
-) -> List[Literal["stacjonarne", "niestacjonarne"]]:
+) -> tuple[List[Literal["stacjonarne", "niestacjonarne"]], Optional[str]]:
     """Koryguje tryb tylko gdy LLM dodał drugi tryb z kontaktu, a nagłówek wskazuje jeden."""
     if len(tryb) <= 1:
-        return tryb
+        return tryb, None
 
     zone = _offer_zone_markdown(markdown)
     has_stacjonarne = bool(TRYB_STACJONARNE_PATTERN.search(zone))
@@ -725,14 +747,14 @@ def normalize_tryb(
 
     if has_stacjonarne and not has_niestacjonarne:
         print("ℹ️ Tryb: skorygowano do stacjonarne (strefa oferty wskazuje jeden tryb).")
-        return ["stacjonarne"]
+        return ["stacjonarne"], "tryb_skorygowany_w_normalizacji"
     if has_niestacjonarne and not has_stacjonarne:
         print("ℹ️ Tryb: skorygowano do niestacjonarne (strefa oferty wskazuje jeden tryb).")
-        return ["niestacjonarne"]
-    return tryb
+        return ["niestacjonarne"], "tryb_skorygowany_w_normalizacji"
+    return tryb, None
 
 
-def extract_with_llm(text: str) -> KierunekStudiow:
+def extract_with_llm(text: str) -> tuple[KierunekStudiow, List[str]]:
     prompt = (
         "Jesteś precyzyjnym ekstraherem danych o kierunkach studiów na polskich uczelniach.\n\n"
         "## ZASADA NADRZĘDNA\n"
@@ -820,10 +842,13 @@ def extract_with_llm(text: str) -> KierunekStudiow:
             "temperature": 0.0,
         },
     )
+    warnings: List[str] = []
     kierunek = KierunekStudiow.model_validate_json(response_text)
     kierunek.czesne = normalize_czesne(kierunek.czesne)
-    kierunek.tryb = normalize_tryb(kierunek.tryb, text)
-    return kierunek
+    kierunek.tryb, tryb_warning = normalize_tryb(kierunek.tryb, text)
+    if tryb_warning:
+        warnings.append(tryb_warning)
+    return kierunek, warnings
 
 
 async def get_course_links(url: str, crawler: AsyncWebCrawler) -> List[str]:
@@ -914,7 +939,10 @@ async def get_course_links(url: str, crawler: AsyncWebCrawler) -> List[str]:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "gemini_configured": _gemini_api_key_configured(),
+    }
 
 
 @app.post("/api/scrape", response_model=ScrapeResponse)
@@ -956,30 +984,45 @@ async def run_spider(request: ScrapeRequest):
             html = getattr(result, "html", None) or getattr(result, "cleaned_html", None) or ""
             print(f"  📄 Markdown: {len(md)} znaków")
             try:
+                item_warnings: List[str] = []
                 md = prepare_markdown_for_extraction(md)
+                md_before_fees = md
                 md = augment_markdown_with_fee_content(md, html)
-                kierunek = await asyncio.to_thread(extract_with_llm, md)
+                if md != md_before_fees:
+                    item_warnings.append("cennik_doklejony_do_markdown")
+                kierunek, llm_warnings = await asyncio.to_thread(extract_with_llm, md)
+                item_warnings.extend(llm_warnings)
                 if not kierunek.czesne:
                     fallback_czesne = extract_czesne_from_html(html)
                     if fallback_czesne:
                         kierunek.czesne = normalize_czesne(fallback_czesne)
+                        item_warnings.append("czesne_uzupelnione_z_html_fallback")
                         print(
                             f"ℹ️ Czesne uzupełnione z HTML "
                             f"({len(kierunek.czesne or [])} wpisów)."
                         )
                     elif _text_has_fee_signals(md):
+                        item_warnings.append("czesne_null_mimo_sygnalow_w_tekscie")
                         print(
                             f"⚠️ Tekst zawiera opłaty, ale LLM zwrócił null dla czesne: {url}"
                         )
-                _warn_if_opis_looks_like_promo(kierunek, url)
-                results.append(ScrapeResultItem(url=url, data=kierunek))
+                opis_warning = _opis_promo_warning(kierunek, url)
+                if opis_warning:
+                    item_warnings.append(opis_warning)
+                results.append(
+                    ScrapeResultItem(url=url, data=kierunek, warnings=item_warnings)
+                )
                 print(f"✅ [{i}/{MAX_COURSES_PER_RUN}] {kierunek.kierunek} | {kierunek.stopien} | {'/'.join(kierunek.tryb)}")
+            except GeminiNotConfiguredError as e:
+                raise HTTPException(status_code=503, detail=str(e)) from e
             except GeminiQuotaError as e:
                 print(f"❌ [{i}/{MAX_COURSES_PER_RUN}] Limit API Gemini: {e}")
                 results.append(ScrapeResultItem(url=url, error=str(e)))
             except Exception as e:
                 print(f"❌ [{i}/{MAX_COURSES_PER_RUN}] Błąd ekstrakcji: {e}")
                 results.append(ScrapeResultItem(url=url, error=str(e)))
+    except GeminiNotConfiguredError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
     except GeminiQuotaError as e:
         raise HTTPException(status_code=429, detail=str(e))
     finally:

@@ -1,0 +1,12 @@
+{
+  "_comment": "PŁ: junk po ścieżce, nie po hoście rekrutacja.p.lodz.pl",
+  "catalog_url": "https://rekrutacja.p.lodz.pl/kierunek",
+  "course_urls": [
+    "https://rekrutacja.p.lodz.pl/kierunek/informatyka-stacjonarne",
+    "https://rekrutacja.p.lodz.pl/kierunek/elektronika-i-telekomunikacja"
+  ],
+  "rejected_urls": [
+    "https://rekrutacja.p.lodz.pl/kontakt",
+    "https://rekrutacja.p.lodz.pl/aktualnosci"
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "_comment": "Koźmiński: opłata semestralna + raty — normalize_czesne odrzuca raty, dopisuje /semestr",
+  "input": [
+    {"wariant": "stacjonarne studia I stopnia", "kwota": "4900 zł"},
+    {"wariant": "płatność za semestr — stacjonarne", "kwota": "4900 zł"},
+    {"wariant": "10 rat miesięcznych", "kwota": "520 zł"}
+  ],
+  "expected_count": 2,
+  "expected_kwotas": [
+    "4900 zł",
+    "4900 zł/semestr"
+  ]
+}
